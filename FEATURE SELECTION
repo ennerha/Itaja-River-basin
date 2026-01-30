@@ -1,0 +1,619 @@
+# ==========================================
+# COLAB: FEATURE SELECTION FOR FLOOD MODELING (ENGLISH-ONLY OUTPUTS)
+#
+# What this script guarantees:
+# - All saved outputs (TXT/CSV/JSON/figures) are written in ENGLISH only.
+# - The rule used to select the FINAL modeling variables is explicit.
+# - A clear list of final variables is printed AND saved to:
+#   - FINAL_SELECTED_VARIABLES.txt
+#   - FINAL_SELECTED_VARIABLES.csv
+#   - FINAL_SELECTED_VARIABLES.json
+# - Robust to Google Drive "Errno 107" by writing locally first, then copying once.
+#
+# Selection rule (explicit):
+# 1) Hygiene: keep variables with valid_fraction >= MIN_VALID_FRAC and variance > LOW_VAR_THR
+# 2) Redundancy control: hierarchical clustering on distance = 1 - |Spearman rho|;
+#    keep 1 representative per cluster (highest Mutual Information) using CORR_THR
+# 3) Relevance: keep MI > quantile(MI_KEEP_QUANTILE)
+# 4) Robustness: stability-weighted permutation importance across subsamples;
+#    keep importance >= quantile(FINAL_STAB_POS_QUANTILE) among positive importances
+# 5) Recommended model variables: quality in {"EXCELLENT","GOOD"} (computed from MI+stability)
+# ==========================================
+
+import os, glob, json, gc, subprocess, shutil
+import numpy as np
+import pandas as pd
+import rasterio
+import geopandas as gpd
+from rasterio.features import geometry_mask
+from rasterio.warp import transform as crs_transform
+
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import roc_auc_score
+
+from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
+from scipy.spatial.distance import squareform
+
+import matplotlib.pyplot as plt
+
+# Optional seaborn for heatmaps
+try:
+    import seaborn as sns
+    HAS_SNS = True
+except Exception:
+    HAS_SNS = False
+
+
+# ---------------------------
+# 0) GOOGLE DRIVE (HARD RESET + HEAL)
+# ---------------------------
+try:
+    from google.colab import drive
+except Exception as e:
+    raise RuntimeError("This script must be executed in Google Colab.") from e
+
+subprocess.run(["bash", "-lc", "fusermount -u /content/drive 2>/dev/null || true"], check=False)
+subprocess.run(["bash", "-lc", "rm -rf /content/drive 2>/dev/null || true"], check=False)
+os.makedirs("/content/drive", exist_ok=True)
+drive.mount("/content/drive", force_remount=True)
+
+def ensure_drive_mounted():
+    """Remount Google Drive if the FUSE endpoint is disconnected."""
+    if not os.path.ismount("/content/drive"):
+        subprocess.run(["bash", "-lc", "fusermount -u /content/drive 2>/dev/null || true"], check=False)
+        subprocess.run(["bash", "-lc", "rm -rf /content/drive 2>/dev/null || true"], check=False)
+        os.makedirs("/content/drive", exist_ok=True)
+        drive.mount("/content/drive", force_remount=True)
+
+
+# ---------------------------
+# 1) PATHS
+# ---------------------------
+BASE = "/content/drive/MyDrive/Transformers"
+FLOOD = os.path.join(BASE, "Flood.tif")
+AOI_SHP = os.path.join(BASE, "Vale_do_Itajai.shp")
+
+if not os.path.exists(BASE):
+    raise RuntimeError(f"BASE folder not found: {BASE}")
+if not os.path.exists(FLOOD):
+    raise RuntimeError(f"Flood reference raster not found: {FLOOD}")
+if not os.path.exists(AOI_SHP):
+    raise RuntimeError(f"AOI shapefile not found: {AOI_SHP}")
+
+# Local outputs (robust) + copy once to Drive at the end
+OUT_LOCAL = "/content/_feature_selection"
+if os.path.exists(OUT_LOCAL):
+    shutil.rmtree(OUT_LOCAL)
+os.makedirs(OUT_LOCAL, exist_ok=True)
+
+OUT_DRIVE = os.path.join(BASE, "_feature_selection")
+
+print("BASE:", BASE)
+print("FLOOD:", FLOOD)
+print("AOI_SHP:", AOI_SHP)
+print("OUT_LOCAL:", OUT_LOCAL)
+print("OUT_DRIVE:", OUT_DRIVE)
+
+
+# ---------------------------
+# 2) CONFIGURATION
+# ---------------------------
+MAX_SAMPLES = 120_000
+POS_FRAC = 0.5
+MIN_VALID_FRAC = 0.95
+LOW_VAR_THR = 1e-8
+
+CORR_THR = 0.85               # variables with |rho| >= CORR_THR are considered redundant
+MI_KEEP_QUANTILE = 0.25       # keep MI > 25th percentile after redundancy pruning
+
+STAB_ROUNDS = 8
+STAB_SUBSAMPLE_FRAC = 0.75
+RANDOM_STATE = 42
+
+SKIP_STACK_LIKE = True
+
+# Explicit final-selection threshold among positive stability importances
+FINAL_STAB_POS_QUANTILE = 0.20
+
+# Recommended model variables are those with these labels
+RECOMMENDED_QUALITIES = {"EXCELLENT", "GOOD"}
+
+# Optional: exclude rasters by name substring (case-insensitive)
+# Example: ["chirps", "precip", "rain", "nov2025"]
+EXCLUDE_NAME_PATTERNS = []
+
+rng = np.random.default_rng(RANDOM_STATE)
+
+
+# ---------------------------
+# 3) RASTER DISCOVERY + FILTERING
+# ---------------------------
+all_tifs = []
+for ext in ["tif", "TIF", "tiff", "TIFF"]:
+    all_tifs += glob.glob(os.path.join(BASE, f"*.{ext}"))
+all_tifs = sorted(set(all_tifs))
+
+print("\nTotal .tif/.tiff files in BASE:", len(all_tifs))
+
+def excluded_by_name(name_lower: str) -> bool:
+    return any(p.lower() in name_lower for p in EXCLUDE_NAME_PATTERNS)
+
+def is_good_singleband_raster(path: str, flood_path: str):
+    name = os.path.splitext(os.path.basename(path))[0]
+    low = name.lower()
+
+    if os.path.abspath(path) == os.path.abspath(flood_path):
+        return False, "is_flood_reference", name
+    if excluded_by_name(low):
+        return False, "excluded_by_name_pattern", name
+    if SKIP_STACK_LIKE and ("stack" in low or "drivers_stack" in low):
+        return False, "skipped_stack_like", name
+
+    try:
+        with rasterio.open(path) as ds:
+            if ds.count != 1:
+                return False, f"skipped_multiband(count={ds.count})", name
+            _ = ds.read(1, window=((0, 1), (0, 1)))
+            if ds.crs is None:
+                return False, "missing_crs", name
+        return True, "ok", name
+    except Exception as e:
+        return False, f"unreadable({type(e).__name__})", name
+
+good_rasters, good_names, bad_records = [], [], []
+for p in all_tifs:
+    ok, reason, nm = is_good_singleband_raster(p, FLOOD)
+    if ok:
+        good_rasters.append(p)
+        good_names.append(nm)
+    else:
+        bad_records.append({"file": os.path.basename(p), "reason": reason})
+
+pd.DataFrame(bad_records).to_csv(os.path.join(OUT_LOCAL, "bad_rasters.csv"), index=False)
+
+print("Valid predictors:", len(good_rasters))
+print("Invalid/Skipped:", len(bad_records))
+if len(good_rasters) == 0:
+    raise RuntimeError("No valid predictor rasters found after filtering. Check bad_rasters.csv.")
+
+
+# ---------------------------
+# 4) LOAD FLOOD/AOI + BALANCED SAMPLING
+# ---------------------------
+with rasterio.open(FLOOD) as ref:
+    y_full = ref.read(1)
+    ref_crs = ref.crs
+    ref_transform = ref.transform
+    H, W = ref.height, ref.width
+    flood_nodata = ref.nodata
+
+aoi = gpd.read_file(AOI_SHP)
+if aoi.crs != ref_crs:
+    aoi = aoi.to_crs(ref_crs)
+
+aoi_mask = geometry_mask(aoi.geometry, out_shape=(H, W), transform=ref_transform, invert=True)
+
+y_bin_full = (y_full > 0).astype(np.uint8)
+valid_base = aoi_mask & np.isfinite(y_full)
+if flood_nodata is not None:
+    valid_base &= (y_full != flood_nodata)
+
+rows, cols = np.where(valid_base)
+if len(rows) == 0:
+    raise RuntimeError("No valid pixels inside AOI on the Flood grid. Check CRS/extent.")
+
+idx_pos = np.where(y_bin_full[rows, cols] == 1)[0]
+idx_neg = np.where(y_bin_full[rows, cols] == 0)[0]
+
+n_pos = min(int(MAX_SAMPLES * POS_FRAC), len(idx_pos))
+n_neg = min(MAX_SAMPLES - n_pos, len(idx_neg))
+
+sel = np.concatenate([
+    rng.choice(idx_pos, n_pos, replace=False) if n_pos > 0 else np.array([], dtype=int),
+    rng.choice(idx_neg, n_neg, replace=False) if n_neg > 0 else np.array([], dtype=int),
+])
+rng.shuffle(sel)
+
+r_s = rows[sel].astype(np.int32)
+c_s = cols[sel].astype(np.int32)
+y = y_bin_full[r_s, c_s].astype(np.uint8)
+
+xs, ys = rasterio.transform.xy(ref_transform, r_s, c_s, offset="center")
+xs = np.array(xs, dtype=np.float64)
+ys = np.array(ys, dtype=np.float64)
+
+print(f"\nSampled points: {len(y):,} | Positive rate: {float(y.mean()):.2%}")
+
+
+# ---------------------------
+# 5) STREAM-SAMPLE PREDICTORS (LOCAL MEMMAP)
+# ---------------------------
+N, C = len(y), len(good_rasters)
+
+X_path = os.path.join(OUT_LOCAL, "X_memmap.float32")
+X = np.memmap(X_path, dtype="float32", mode="w+", shape=(N, C))
+
+valid_counts = np.zeros(C, dtype=np.int64)
+nan_counts = np.zeros(C, dtype=np.int64)
+variances = np.zeros(C, dtype=np.float64)
+
+for j, (rp, name) in enumerate(zip(good_rasters, good_names)):
+    try:
+        with rasterio.open(rp) as src:
+            if src.crs != ref_crs:
+                x2, y2 = crs_transform(ref_crs, src.crs, xs.tolist(), ys.tolist())
+                pts = list(zip(x2, y2))
+            else:
+                pts = list(zip(xs.tolist(), ys.tolist()))
+
+            vals = np.array([v[0] for v in src.sample(pts)], dtype=np.float32)
+            if src.nodata is not None:
+                vals = np.where(vals == src.nodata, np.nan, vals)
+
+        X[:, j] = vals
+
+        good = np.isfinite(vals)
+        valid_counts[j] = int(good.sum())
+        nan_counts[j] = int((~good).sum())
+        variances[j] = float(np.nanvar(vals)) if good.any() else 0.0
+
+        if (j + 1) % 10 == 0 or (j + 1) == C:
+            print(f"[{j+1}/{C}] sampled {name} | valid={valid_counts[j]} nan={nan_counts[j]} var={variances[j]:.3e}")
+            gc.collect()
+
+    except Exception as e:
+        X[:, j] = np.nan
+        valid_counts[j] = 0
+        nan_counts[j] = N
+        variances[j] = 0.0
+        print(f"!! Failed sampling {name}: {type(e).__name__}")
+
+X_df = pd.DataFrame(X, columns=good_names)
+
+
+# ---------------------------
+# 6) HYGIENE FILTERS
+# ---------------------------
+report = pd.DataFrame({
+    "variable": good_names,
+    "valid_fraction": valid_counts / N,
+    "variance": variances
+})
+
+keep_valid = report["valid_fraction"].values >= MIN_VALID_FRAC
+keep_var = report["variance"].values > LOW_VAR_THR
+keep = keep_valid & keep_var
+
+kept_vars = report.loc[keep, "variable"].tolist()
+print("\n" + "=" * 80)
+print(f"After hygiene: kept {len(kept_vars)} variables | dropped {int((~keep).sum())}")
+print("=" * 80)
+
+if len(kept_vars) < 3:
+    raise RuntimeError("Too few variables after hygiene. Adjust MIN_VALID_FRAC/LOW_VAR_THR if needed.")
+
+X_h = X_df[kept_vars].copy()
+X_h = X_h.fillna(X_h.median(axis=0, skipna=True))
+
+
+# ---------------------------
+# 7) REDUNDANCY CONTROL (CORRELATION CLUSTERS) + REPRESENTATIVE SELECTION
+# ---------------------------
+print("\nComputing Spearman correlation matrix...")
+sub_n = min(80_000, len(X_h))
+sub_idx = rng.choice(len(X_h), sub_n, replace=False)
+
+corr = X_h.iloc[sub_idx].corr(method="spearman").abs()
+dist = 1 - corr
+Z = linkage(squareform(dist.values, checks=False), method="average")
+
+clusters = fcluster(Z, t=1 - CORR_THR, criterion="distance")
+cluster_df = pd.DataFrame({"variable": corr.columns, "cluster_id": clusters})
+
+print("Computing Mutual Information (to choose cluster representatives)...")
+mi_all = mutual_info_classif(
+    X_h.iloc[sub_idx].values,
+    y[sub_idx],
+    n_neighbors=5,
+    random_state=RANDOM_STATE
+)
+mi_s = pd.Series(mi_all, index=X_h.columns)
+
+representatives = []
+cluster_info = []
+
+for cid in sorted(cluster_df["cluster_id"].unique()):
+    group = cluster_df.loc[cluster_df["cluster_id"] == cid, "variable"].tolist()
+    if len(group) == 1:
+        best = group[0]
+    else:
+        best = mi_s[group].idxmax()
+
+    representatives.append(best)
+    cluster_info.append({
+        "cluster_id": int(cid),
+        "n_variables": int(len(group)),
+        "representative": best,
+        "representative_mi": float(mi_s[best]),
+        "members": ", ".join(group)
+    })
+
+pd.DataFrame(cluster_info).sort_values("representative_mi", ascending=False).to_csv(
+    os.path.join(OUT_LOCAL, "correlation_clusters.csv"),
+    index=False
+)
+
+print(f"Redundancy pruning: {len(kept_vars)} -> {len(representatives)} "
+      f"(1 representative per cluster where |rho| >= {CORR_THR})")
+
+X_r = X_h[representatives].copy()
+
+
+# ---------------------------
+# 8) MI FILTER (NONLINEAR RELEVANCE)
+# ---------------------------
+mi_r = mi_s[representatives].sort_values(ascending=False)
+mi_cut = mi_r.quantile(MI_KEEP_QUANTILE)
+mi_keep = mi_r[mi_r > mi_cut].index.tolist()
+
+X_mi = X_r[mi_keep].copy()
+
+print(f"MI filter: {len(representatives)} -> {len(mi_keep)} "
+      f"(keep MI > quantile {MI_KEEP_QUANTILE:.2f} = {mi_cut:.6f})")
+
+if len(mi_keep) < 3:
+    raise RuntimeError("Too few variables after MI filter. Adjust MI_KEEP_QUANTILE if needed.")
+
+
+# ---------------------------
+# 9) STABILITY SELECTION (ROBUSTNESS)
+# ---------------------------
+print("\nStability selection via permutation importance...")
+imp_acc = pd.Series(0.0, index=X_mi.columns)
+
+for k in range(STAB_ROUNDS):
+    m = int(len(X_mi) * STAB_SUBSAMPLE_FRAC)
+    idx = rng.choice(len(X_mi), m, replace=False)
+
+    clf = ExtraTreesClassifier(
+        n_estimators=350,
+        max_depth=14,
+        n_jobs=-1,
+        class_weight="balanced",
+        random_state=RANDOM_STATE + k
+    )
+    clf.fit(X_mi.iloc[idx].values, y[idx])
+
+    perm = permutation_importance(
+        clf,
+        X_mi.iloc[idx].values,
+        y[idx],
+        n_repeats=3,
+        n_jobs=-1,
+        random_state=RANDOM_STATE + k
+    )
+
+    imp_acc += pd.Series(perm.importances_mean, index=X_mi.columns).clip(lower=0)
+
+    p = clf.predict_proba(X_mi.iloc[idx].values)[:, 1]
+    auc = roc_auc_score(y[idx], p)
+    print(f"  Round {k+1}/{STAB_ROUNDS} | AUC={auc:.3f}")
+
+imp_stab = (imp_acc / STAB_ROUNDS).sort_values(ascending=False)
+
+pos_imp = imp_stab[imp_stab > 0]
+thr = float(pos_imp.quantile(FINAL_STAB_POS_QUANTILE)) if len(pos_imp) else 0.0
+final_robust_set = imp_stab[imp_stab >= thr].index.tolist()
+
+print(f"Stability threshold: {thr:.8f} (quantile {FINAL_STAB_POS_QUANTILE:.2f} of positive importances)")
+print(f"Final robust set size: {len(final_robust_set)}")
+
+
+# ---------------------------
+# 10) CONSOLIDATED RANKING + RECOMMENDED MODEL SET
+# ---------------------------
+ranking = pd.DataFrame({
+    "variable": final_robust_set,
+    "mutual_information": mi_s[final_robust_set].values,
+    "stability_importance": imp_stab[final_robust_set].values
+})
+
+# Normalize to [0,1]
+ranking["mi_norm"] = (ranking["mutual_information"] - ranking["mutual_information"].min()) / \
+                     (ranking["mutual_information"].max() - ranking["mutual_information"].min() + 1e-10)
+ranking["stab_norm"] = (ranking["stability_importance"] - ranking["stability_importance"].min()) / \
+                       (ranking["stability_importance"].max() - ranking["stability_importance"].min() + 1e-10)
+
+# Harmonic mean (balances relevance and robustness)
+ranking["consolidated_score"] = 2 * (ranking["mi_norm"] * ranking["stab_norm"]) / \
+                                (ranking["mi_norm"] + ranking["stab_norm"] + 1e-10)
+
+# Maximum correlation with others in the robust set
+max_corr = []
+for v in final_robust_set:
+    others = [x for x in final_robust_set if x != v]
+    max_corr.append(float(corr.loc[v, others].max()) if len(others) else 0.0)
+ranking["max_correlation_with_others"] = max_corr
+
+ranking = ranking.sort_values("consolidated_score", ascending=False)
+ranking["rank"] = range(1, len(ranking) + 1)
+
+def label_quality(row):
+    if row["consolidated_score"] >= 0.7 and row["max_correlation_with_others"] < 0.6:
+        return "EXCELLENT"
+    if row["consolidated_score"] >= 0.5 and row["max_correlation_with_others"] < 0.7:
+        return "GOOD"
+    if row["consolidated_score"] >= 0.3:
+        return "MODERATE"
+    return "WEAK"
+
+ranking["quality"] = ranking.apply(label_quality, axis=1)
+
+recommended_model_vars = ranking.loc[ranking["quality"].isin(RECOMMENDED_QUALITIES), "variable"].tolist()
+
+# Fallback if thresholds are too strict (rare)
+if len(recommended_model_vars) == 0:
+    recommended_model_vars = ranking["variable"].head(min(10, len(ranking))).tolist()
+
+
+# ---------------------------
+# 11) SAVE EXPLICIT FINAL LISTS (ENGLISH-ONLY)
+# ---------------------------
+ranking.to_csv(os.path.join(OUT_LOCAL, "ranking_consolidated.csv"), index=False)
+
+rule_text = (
+    "SELECTION RULE (EXPLICIT):\n\n"
+    f"1) Hygiene:\n"
+    f"   - valid_fraction >= {MIN_VALID_FRAC}\n"
+    f"   - variance > {LOW_VAR_THR}\n\n"
+    f"2) Redundancy control:\n"
+    f"   - Hierarchical clustering on distance = 1 - |Spearman rho|\n"
+    f"   - Correlation threshold: |rho| >= {CORR_THR}\n"
+    f"   - Keep 1 representative per cluster (highest Mutual Information)\n\n"
+    f"3) Relevance:\n"
+    f"   - Keep MI > quantile {MI_KEEP_QUANTILE:.2f}\n\n"
+    f"4) Robustness:\n"
+    f"   - Stability-weighted permutation importance across subsamples\n"
+    f"   - Keep importance >= quantile {FINAL_STAB_POS_QUANTILE:.2f} among positive importances\n\n"
+    f"RECOMMENDED MODEL INPUT VARIABLES:\n"
+    f"   - Variables labeled as {sorted(list(RECOMMENDED_QUALITIES))} based on consolidated_score\n"
+)
+
+with open(os.path.join(OUT_LOCAL, "FINAL_SELECTED_VARIABLES.txt"), "w", encoding="utf-8") as f:
+    f.write(rule_text)
+    f.write("\n\nRECOMMENDED MODEL VARIABLES (USE THESE FOR MODELING):\n")
+    for v in recommended_model_vars:
+        f.write(f"- {v}\n")
+
+pd.DataFrame({"variable": recommended_model_vars}).to_csv(
+    os.path.join(OUT_LOCAL, "FINAL_SELECTED_VARIABLES.csv"),
+    index=False
+)
+
+with open(os.path.join(OUT_LOCAL, "FINAL_SELECTED_VARIABLES.json"), "w", encoding="utf-8") as f:
+    json.dump({
+        "rule": {
+            "hygiene_min_valid_fraction": MIN_VALID_FRAC,
+            "hygiene_low_variance_threshold": LOW_VAR_THR,
+            "correlation_threshold_abs_spearman": CORR_THR,
+            "mi_keep_quantile": MI_KEEP_QUANTILE,
+            "stability_positive_importance_quantile": FINAL_STAB_POS_QUANTILE,
+            "recommended_qualities": sorted(list(RECOMMENDED_QUALITIES))
+        },
+        "recommended_model_variables": recommended_model_vars,
+        "final_robust_set": final_robust_set,
+        "representatives_after_redundancy_pruning": representatives,
+        "mi_kept_set": mi_keep
+    }, f, indent=2, ensure_ascii=False)
+
+# Console print (English)
+print("\n" + "=" * 100)
+print("RECOMMENDED MODEL VARIABLES (CLEAR FINAL LIST)")
+print("These are the variables you should feed into the flood model.")
+print(f"N = {len(recommended_model_vars)}")
+print("-" * 100)
+print(", ".join(recommended_model_vars))
+print("=" * 100)
+
+
+# ---------------------------
+# 12) FIGURES (ENGLISH TITLES)
+# ---------------------------
+# A) Recommended-set correlation heatmap
+if len(recommended_model_vars) > 1:
+    rec_corr = corr.loc[recommended_model_vars, recommended_model_vars]
+    fig_w = max(10, len(recommended_model_vars) * 0.5)
+
+    if HAS_SNS:
+        plt.figure(figsize=(fig_w, fig_w))
+        sns.heatmap(rec_corr, vmin=0, vmax=1, cmap="coolwarm", square=True,
+                    cbar_kws={"label": "|Spearman ρ|"})
+        plt.title(f"Correlation heatmap (recommended model set) | N={len(recommended_model_vars)} | thr={CORR_THR}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUT_LOCAL, "RECOMMENDED_MODEL_correlation_heatmap.png"), dpi=300, bbox_inches="tight")
+        plt.close()
+    else:
+        plt.figure(figsize=(fig_w, fig_w))
+        plt.imshow(rec_corr.values, vmin=0, vmax=1, cmap="coolwarm")
+        plt.colorbar(label="|Spearman ρ|")
+        plt.xticks(range(len(recommended_model_vars)), recommended_model_vars, rotation=90, fontsize=8)
+        plt.yticks(range(len(recommended_model_vars)), recommended_model_vars, fontsize=8)
+        plt.title(f"Correlation heatmap (recommended model set) | N={len(recommended_model_vars)} | thr={CORR_THR}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUT_LOCAL, "RECOMMENDED_MODEL_correlation_heatmap.png"), dpi=300, bbox_inches="tight")
+        plt.close()
+
+# B) Dendrogram (full)
+plt.figure(figsize=(16, 6))
+dendrogram(Z, labels=corr.columns, leaf_rotation=90, leaf_font_size=7)
+plt.axhline(y=1 - CORR_THR, color="red", linestyle="--", linewidth=2,
+            label=f"Correlation threshold |rho| = {CORR_THR}")
+plt.title("Hierarchical clustering of predictors (distance = 1 − |Spearman ρ|)")
+plt.ylabel("Distance")
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_LOCAL, "dendrogram_full.png"), dpi=300, bbox_inches="tight")
+plt.close()
+
+# C) Top MI
+mi_top = mi_s.sort_values(ascending=False).head(min(30, len(mi_s)))
+plt.figure(figsize=(11, max(7, len(mi_top) * 0.25)))
+plt.barh(range(len(mi_top)), mi_top.values, alpha=0.85)
+plt.yticks(range(len(mi_top)), mi_top.index, fontsize=9)
+plt.xlabel("Mutual Information")
+plt.title("Top predictors by Mutual Information (nonlinear relevance)")
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_LOCAL, "mi_top30.png"), dpi=300, bbox_inches="tight")
+plt.close()
+
+# D) Stability importance (top)
+imp_top = imp_stab.head(min(30, len(imp_stab)))
+plt.figure(figsize=(11, max(7, len(imp_top) * 0.25)))
+plt.barh(range(len(imp_top)), imp_top.values, alpha=0.85)
+plt.yticks(range(len(imp_top)), imp_top.index, fontsize=9)
+plt.xlabel("Stability-weighted permutation importance")
+plt.title("Top predictors by stability-weighted importance (robustness)")
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_LOCAL, "stability_top30.png"), dpi=300, bbox_inches="tight")
+plt.close()
+
+# E) Consolidated ranking bar plot
+colors = {"EXCELLENT": "#2ecc71", "GOOD": "#3498db", "MODERATE": "#f39c12", "WEAK": "#e74c3c"}
+bar_colors = [colors[q] for q in ranking["quality"]]
+
+plt.figure(figsize=(14, max(8, len(ranking) * 0.3)))
+plt.barh(range(len(ranking)), ranking["consolidated_score"].values, color=bar_colors, alpha=0.9)
+plt.yticks(range(len(ranking)), ranking["variable"].values, fontsize=9)
+plt.xlabel("Consolidated score (harmonic mean of MI and stability)")
+plt.title("Selected predictors ranking (non-redundant + informative + robust)")
+plt.grid(axis="x", alpha=0.3)
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_LOCAL, "ranking_visual.png"), dpi=300, bbox_inches="tight")
+plt.close()
+
+
+# ---------------------------
+# 13) COPY OUTPUTS TO DRIVE (ONE SHOT)
+# ---------------------------
+print("\nCopying outputs to Google Drive...")
+ensure_drive_mounted()
+
+subprocess.run(["bash", "-lc", f"rm -rf '{OUT_DRIVE}'"], check=False)
+os.makedirs(OUT_DRIVE, exist_ok=True)
+
+for fn in os.listdir(OUT_LOCAL):
+    shutil.copy2(os.path.join(OUT_LOCAL, fn), os.path.join(OUT_DRIVE, fn))
+
+print("Done.")
+print("Saved to:", OUT_DRIVE)
+print("Key files:")
+print(" - FINAL_SELECTED_VARIABLES.txt")
+print(" - FINAL_SELECTED_VARIABLES.csv")
+print(" - FINAL_SELECTED_VARIABLES.json")
+print(" - ranking_consolidated.csv")
+print(" - RECOMMENDED_MODEL_correlation_heatmap.png")

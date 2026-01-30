@@ -1,0 +1,818 @@
+# =====================================================================================
+# FAULT-TOLERANT FLOOD MODELING PIPELINE (RESUME + CHECKPOINTS + CORRECT MODEL SELECTION)
+# English-only outputs | Memory-mapped features | Spatial CV | Saves best model properly
+# - Fix: best model is selected by MEAN CV performance (not best single fold)
+# - Adds: mean±std table, tie-breakers, best-fold model export, final model training, full-map prediction
+# =====================================================================================
+
+import os, re, glob, json, difflib, gc, warnings, math
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.features import geometry_mask
+from rasterio.warp import transform as crs_transform
+import geopandas as gpd
+
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import roc_auc_score, f1_score, balanced_accuracy_score, precision_recall_curve, auc, brier_score_loss
+from sklearn.metrics import confusion_matrix, matthews_corrcoef
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+import joblib
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------
+# CONFIG
+# ---------------------------
+class CFG:
+    BASE = "/content/drive/MyDrive/Transformers"
+    OUTDIR = os.path.join(BASE, "_advanced_models_resume_fixed")
+    os.makedirs(OUTDIR, exist_ok=True)
+
+    FLOOD = os.path.join(BASE, "Flood.tif")
+    AOI = os.path.join(BASE, "Vale_do_Itajai.shp")
+
+    # Fixed recommended static controls
+    FEATURES = ["Slope","TWI","DEM","LULC","CN","Landforms","Soils","Geology","Rivers","Profile Curvature"]
+
+    # Sampling
+    MAX_SAMPLES = 150_000
+    POS_FRAC = 0.5
+    RANDOM_STATE = 42
+
+    # Spatial CV
+    N_FOLDS = 5
+    N_BLOCKS = 5
+
+    # Transformer training
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    EPOCHS = 25
+    BATCH = 2048
+    LR = 1e-3
+    WD = 1e-4
+    EARLY_PATIENCE = 5
+
+    # Prediction (full-map inference)
+    PRED_BATCH = 200_000         # points per batch
+    WINDOW_SIZE = 1024           # tile size
+
+rng = np.random.default_rng(CFG.RANDOM_STATE)
+
+# ---------------------------
+# PATHS (CHECKPOINTS)
+# ---------------------------
+P_RESOLVED = os.path.join(CFG.OUTDIR, "resolved_feature_paths.csv")
+P_SAMPLE = os.path.join(CFG.OUTDIR, "sample_points.npz")          # rows, cols, y
+P_SPLITS = os.path.join(CFG.OUTDIR, "splits.json")                # fold train/test indices
+P_XMEM = os.path.join(CFG.OUTDIR, "X_features_memmap.float32")    # memmap data
+P_XMETA = os.path.join(CFG.OUTDIR, "X_meta.json")                 # shape + feature names
+P_FOLD_RESULTS = os.path.join(CFG.OUTDIR, "fold_results.csv")     # incremental fold results
+P_MODEL_DIR = os.path.join(CFG.OUTDIR, "saved_models")            # per-fold models
+os.makedirs(P_MODEL_DIR, exist_ok=True)
+
+P_MODEL_MEAN_STD = os.path.join(CFG.OUTDIR, "model_mean_std.csv")
+P_MODEL_RANKING = os.path.join(CFG.OUTDIR, "model_ranking_by_mean_auc.csv")
+
+P_BEST_SUMMARY = os.path.join(CFG.OUTDIR, "best_model_summary.json")
+P_BEST_FOLD_EXPORT = os.path.join(CFG.OUTDIR, "best_single_fold_run.json")
+
+P_BEST_MODEL_SK = os.path.join(CFG.OUTDIR, "best_model.joblib")
+P_BEST_MODEL_PT = os.path.join(CFG.OUTDIR, "best_model.pt")
+
+P_FINAL_MODEL_SK = os.path.join(CFG.OUTDIR, "final_model_all_data.joblib")
+P_FINAL_MODEL_PT = os.path.join(CFG.OUTDIR, "final_model_all_data.pt")
+P_FINAL_SCALER = os.path.join(CFG.OUTDIR, "final_transformer_scaler.json")
+
+P_PRED_PROB = os.path.join(CFG.OUTDIR, "predicted_flood_probability.tif")
+P_PRED_BIN = os.path.join(CFG.OUTDIR, "predicted_flood_binary.tif")
+
+# ---------------------------
+# UTIL: name matching
+# ---------------------------
+def norm_key(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"\.(tif|tiff)$", "", s)
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+def build_raster_index(base: str):
+    paths = []
+    for ext in ("tif","TIF","tiff","TIFF"):
+        paths.extend(glob.glob(os.path.join(base, "**", f"*.{ext}"), recursive=True))
+    paths = sorted(set(paths))
+    idx = {}
+    for p in paths:
+        k = norm_key(os.path.basename(p))
+        idx.setdefault(k, []).append(p)
+    return idx, paths
+
+def resolve_feature_paths(features):
+    idx, allp = build_raster_index(CFG.BASE)
+    resolved, missing = [], []
+    for feat in features:
+        k = norm_key(feat)
+        if k in idx:
+            p = sorted(idx[k], key=lambda x: (len(x), x))[0]
+            resolved.append((feat, p, "exact_normalized_match"))
+            continue
+        close = difflib.get_close_matches(k, list(idx.keys()), n=5, cutoff=0.72)
+        if close:
+            ck = close[0]
+            p = sorted(idx[ck], key=lambda x: (len(x), x))[0]
+            resolved.append((feat, p, f"fuzzy_match({ck})"))
+            continue
+        found = None
+        for p in allp:
+            if k in norm_key(os.path.basename(p)):
+                found = p
+                break
+        if found:
+            resolved.append((feat, found, "substring_match"))
+        else:
+            missing.append(feat)
+
+    if missing:
+        raise RuntimeError(f"Missing feature rasters for: {missing}")
+
+    df = pd.DataFrame(resolved, columns=["feature","path","match"])
+    df.to_csv(P_RESOLVED, index=False)
+    return df
+
+# ---------------------------
+# METRICS
+# ---------------------------
+def safe_confusion(y_true, y_pred):
+    cm = confusion_matrix(y_true, y_pred, labels=[0,1])
+    tn, fp, fn, tp = cm.ravel()
+    return tn, fp, fn, tp
+
+def compute_metrics(y_true, y_prob, thr=0.5):
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
+    y_pred = (y_prob >= thr).astype(int)
+    tn, fp, fn, tp = safe_confusion(y_true, y_pred)
+    pr, re_, _ = precision_recall_curve(y_true, y_prob)
+    pr_auc = auc(re_, pr)
+    try:
+        roc = roc_auc_score(y_true, y_prob)
+    except Exception:
+        roc = np.nan
+    try:
+        mcc = matthews_corrcoef(y_true, y_pred)
+    except Exception:
+        mcc = np.nan
+    brier = brier_score_loss(y_true, y_prob)
+    eps = 1e-10
+    logloss = -np.mean(y_true*np.log(y_prob+eps) + (1-y_true)*np.log(1-y_prob+eps))
+    return {
+        "ROC_AUC": float(roc) if np.isfinite(roc) else np.nan,
+        "PR_AUC": float(pr_auc),
+        "F1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "Balanced_Accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "MCC": float(mcc) if np.isfinite(mcc) else np.nan,
+        "Brier": float(brier),
+        "Log_Loss": float(logloss),
+        "Sensitivity": float(tp/(tp+fn)) if (tp+fn)>0 else 0.0,
+        "Specificity": float(tn/(tn+fp)) if (tn+fp)>0 else 0.0,
+        "Precision": float(tp/(tp+fp)) if (tp+fp)>0 else 0.0,
+        "NPV": float(tn/(tn+fn)) if (tn+fn)>0 else 0.0,
+        "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)
+    }
+
+# ---------------------------
+# TRANSFORMER + DATASET (robust scaling on-the-fly)
+# ---------------------------
+def fit_robust_params(X_mem, train_idx, max_fit_points=200_000):
+    train_idx = np.asarray(train_idx, dtype=np.int64)
+    if len(train_idx) > max_fit_points:
+        train_idx = rng.choice(train_idx, size=max_fit_points, replace=False)
+    Xs = np.asarray(X_mem[train_idx], dtype=np.float32)
+    med = np.median(Xs, axis=0)
+    q1 = np.quantile(Xs, 0.25, axis=0)
+    q3 = np.quantile(Xs, 0.75, axis=0)
+    iqr = (q3 - q1)
+    iqr = np.where(iqr < 1e-6, 1.0, iqr).astype(np.float32)
+    return med.astype(np.float32), iqr
+
+class FTTransformer(nn.Module):
+    def __init__(self, n_features, d_model=128, nhead=8, num_layers=4, dropout=0.2):
+        super().__init__()
+        self.inp = nn.Linear(n_features, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+        enc = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_model*4,
+            dropout=dropout, batch_first=True, norm_first=True
+        )
+        self.encoder = nn.TransformerEncoder(enc, num_layers=num_layers)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model//2), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(d_model//2, 1)
+        )
+    def forward(self, x):
+        x = self.drop(self.norm(self.inp(x))).unsqueeze(1)
+        x = self.encoder(x).squeeze(1)
+        return torch.sigmoid(self.head(x)).squeeze(-1)
+
+def train_torch_model(model, train_loader, val_loader, device, epochs, patience):
+    opt = torch.optim.AdamW(model.parameters(), lr=CFG.LR, weight_decay=CFG.WD)
+    sch = ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=3)
+    crit = nn.BCELoss()
+
+    best_auc = -np.inf
+    best_state = None
+    bad = 0
+
+    for ep in range(epochs):
+        model.train()
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+            pred = model(xb)
+            loss = crit(pred, yb)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+        model.eval()
+        yt, yp = [], []
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device, non_blocking=True)
+                p = model(xb).detach().cpu().numpy()
+                yp.append(p)
+                yt.append(yb.numpy())
+        yt = np.concatenate(yt); yp = np.concatenate(yp)
+        try:
+            vauc = roc_auc_score(yt, yp)
+        except Exception:
+            vauc = np.nan
+
+        if np.isfinite(vauc):
+            sch.step(vauc)
+
+        if np.isfinite(vauc) and vauc > best_auc + 1e-6:
+            best_auc = vauc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+
+        if ep % 5 == 0:
+            print(f"    Epoch {ep+1:02d}/{epochs} | Val ROC-AUC={vauc:.4f}")
+
+        if bad >= patience:
+            print(f"    Early stopping at epoch {ep+1}")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return float(best_auc) if np.isfinite(best_auc) else np.nan
+
+# ---------------------------
+# STEP A: PREPARE / RESUME SAMPLE + SPLITS + MEMMAP
+# ---------------------------
+def prepare_or_resume():
+    # Resolve feature paths
+    if os.path.exists(P_RESOLVED):
+        resolved = pd.read_csv(P_RESOLVED)
+    else:
+        resolved = resolve_feature_paths(CFG.FEATURES)
+
+    # Load flood + AOI and sample points (resume)
+    if os.path.exists(P_SAMPLE):
+        dat = np.load(P_SAMPLE)
+        rows = dat["rows"].astype(np.int32)
+        cols = dat["cols"].astype(np.int32)
+        y = dat["y"].astype(np.uint8)
+        with rasterio.open(CFG.FLOOD) as src:
+            transform = src.transform
+            crs = src.crs
+            H, W = src.height, src.width
+        print(f"Resumed sample points: {len(y):,}")
+    else:
+        with rasterio.open(CFG.FLOOD) as src:
+            flood = src.read(1)
+            transform = src.transform
+            crs = src.crs
+            H, W = src.height, src.width
+            nodata = src.nodata
+
+        aoi = gpd.read_file(CFG.AOI).to_crs(crs)
+        mask = geometry_mask(aoi.geometry, (H, W), transform, invert=True)
+
+        y_full = (flood > 0).astype(np.uint8)
+        valid = mask & np.isfinite(flood)
+        if nodata is not None:
+            valid &= (flood != nodata)
+
+        rr, cc = np.where(valid)
+        y_all = y_full[rr, cc]
+
+        pos = np.where(y_all == 1)[0]
+        neg = np.where(y_all == 0)[0]
+
+        n_pos = min(int(CFG.MAX_SAMPLES * CFG.POS_FRAC), len(pos))
+        n_neg = min(CFG.MAX_SAMPLES - n_pos, len(neg))
+
+        sel = np.concatenate([
+            rng.choice(pos, n_pos, replace=False) if n_pos > 0 else np.array([], dtype=int),
+            rng.choice(neg, n_neg, replace=False) if n_neg > 0 else np.array([], dtype=int),
+        ])
+        rng.shuffle(sel)
+
+        rows = rr[sel].astype(np.int32)
+        cols = cc[sel].astype(np.int32)
+        y = y_all[sel].astype(np.uint8)
+
+        np.savez_compressed(P_SAMPLE, rows=rows, cols=cols, y=y)
+        print(f"Saved sample points: {len(y):,} | Flood rate: {float(y.mean()):.2%}")
+
+    # Spatial groups
+    block_row = np.floor(rows / (H / CFG.N_BLOCKS)).astype(int)
+    block_col = np.floor(cols / (W / CFG.N_BLOCKS)).astype(int)
+    groups = (block_row * CFG.N_BLOCKS + block_col).astype(np.int32)
+
+    # Save splits (resume)
+    if os.path.exists(P_SPLITS):
+        with open(P_SPLITS, "r", encoding="utf-8") as f:
+            splits = json.load(f)
+        print("Resumed CV splits.")
+    else:
+        gkf = GroupKFold(n_splits=CFG.N_FOLDS)
+        splits = {}
+        for i, (tr, te) in enumerate(gkf.split(np.zeros(len(y)), y, groups), 1):
+            splits[str(i)] = {"train": tr.tolist(), "test": te.tolist()}
+        with open(P_SPLITS, "w", encoding="utf-8") as f:
+            json.dump(splits, f)
+        print("Saved CV splits.")
+
+    # Feature memmap (resume)
+    C = len(resolved)
+    N = len(y)
+
+    if os.path.exists(P_XMETA) and os.path.exists(P_XMEM):
+        with open(P_XMETA, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if meta.get("N") == N and meta.get("C") == C:
+            X = np.memmap(P_XMEM, dtype="float32", mode="r+", shape=(N, C))
+            print("Resumed feature memmap matrix.")
+            return resolved, rows, cols, y, groups, transform, crs, H, W, splits, X
+
+    # Build memmap from scratch (disk-based)
+    X = np.memmap(P_XMEM, dtype="float32", mode="w+", shape=(N, C))
+
+    xs, ys = rasterio.transform.xy(transform, rows, cols, offset="center")
+    xs = np.array(xs, dtype=np.float64)
+    ys = np.array(ys, dtype=np.float64)
+
+    stats = []
+    for j, r in enumerate(resolved.itertuples(index=False)):
+        feat, path = r.feature, r.path
+        with rasterio.open(path) as src:
+            if src.crs != crs:
+                x2, y2 = crs_transform(crs, src.crs, xs.tolist(), ys.tolist())
+                pts = list(zip(x2, y2))
+            else:
+                pts = list(zip(xs.tolist(), ys.tolist()))
+            vals = np.array([v[0] for v in src.sample(pts)], dtype=np.float32)
+            if src.nodata is not None:
+                vals = np.where(vals == src.nodata, np.nan, vals)
+
+        miss = float(np.isnan(vals).mean() * 100.0)
+        med = float(np.nanmedian(vals))
+        if np.isnan(vals).any():
+            vals = np.where(np.isfinite(vals), vals, med).astype(np.float32)
+
+        X[:, j] = vals
+        stats.append({"feature": feat, "missing_pct": miss, "median_imputation": med})
+        if (j+1) % 2 == 0 or (j+1) == C:
+            print(f"Loaded {j+1}/{C} features...")
+        gc.collect()
+
+    pd.DataFrame(stats).to_csv(os.path.join(CFG.OUTDIR, "feature_statistics.csv"), index=False)
+    with open(P_XMETA, "w", encoding="utf-8") as f:
+        json.dump({"N": N, "C": C, "features": resolved["feature"].tolist()}, f, indent=2)
+
+    print("Saved feature memmap matrix + metadata.")
+    return resolved, rows, cols, y, groups, transform, crs, H, W, splits, X
+
+# ---------------------------
+# STEP B: TRAIN WITH RESUME (FOLD-BY-FOLD CHECKPOINTS)
+# ---------------------------
+def train_with_resume(resolved, y, splits, X):
+    # Load existing fold results if present
+    if os.path.exists(P_FOLD_RESULTS):
+        fold_df = pd.read_csv(P_FOLD_RESULTS)
+        done = set(zip(fold_df["model"].astype(str), fold_df["fold"].astype(int)))
+        print(f"Resuming training: {len(done)} fold-runs already completed.")
+    else:
+        fold_df = pd.DataFrame()
+        done = set()
+
+    results_rows = [] if fold_df.empty else fold_df.to_dict("records")
+
+    # Define models
+    baselines = {
+        "LogisticRegression": Pipeline([("scaler", StandardScaler()),
+                                       ("clf", LogisticRegression(max_iter=1200, class_weight="balanced"))]),
+        "RandomForest": RandomForestClassifier(n_estimators=350, max_depth=16, min_samples_split=10,
+                                               class_weight="balanced", n_jobs=-1, random_state=CFG.RANDOM_STATE),
+        "GradientBoosting": GradientBoostingClassifier(n_estimators=250, learning_rate=0.05, subsample=0.8,
+                                                       max_depth=3, random_state=CFG.RANDOM_STATE),
+    }
+
+    transformer_specs = {
+        "FT-Transformer": {"class": FTTransformer, "params": {"d_model": 128, "nhead": 8, "num_layers": 4, "dropout": 0.2}},
+    }
+
+    # Train baselines fold-by-fold (save each fold model)
+    for model_name, model in baselines.items():
+        for fold in range(1, CFG.N_FOLDS + 1):
+            if (model_name, fold) in done:
+                continue
+            tr = np.array(splits[str(fold)]["train"], dtype=np.int64)
+            te = np.array(splits[str(fold)]["test"], dtype=np.int64)
+
+            model.fit(X[tr], y[tr])
+            y_prob = model.predict_proba(X[te])[:, 1]
+            met = compute_metrics(y[te], y_prob)
+
+            # Save fold model
+            joblib.dump(model, os.path.join(P_MODEL_DIR, f"{model_name}_fold{fold}.joblib"))
+
+            row = {"model": model_name, "fold": fold, **met}
+            results_rows.append(row)
+            pd.DataFrame(results_rows).to_csv(P_FOLD_RESULTS, index=False)  # checkpoint every fold
+            done.add((model_name, fold))
+            print(f"{model_name} fold {fold} saved | ROC_AUC={met['ROC_AUC']:.4f}")
+            gc.collect()
+
+    # Train Transformer fold-by-fold (save each fold model + scaler params)
+    device = CFG.DEVICE
+    print(f"PyTorch device: {device}")
+
+    class _MemmapTorchDataset(Dataset):
+        def __init__(self, X_mem, y_arr, idx, med, iqr, augment=False):
+            self.X = X_mem
+            self.y = y_arr
+            self.idx = np.asarray(idx, dtype=np.int64)
+            self.med = torch.tensor(med, dtype=torch.float32)
+            self.iqr = torch.tensor(iqr, dtype=torch.float32)
+            self.augment = augment
+        def __len__(self):
+            return len(self.idx)
+        def __getitem__(self, i):
+            k = self.idx[i]
+            x = torch.from_numpy(np.array(self.X[k], dtype=np.float32, copy=False))
+            x = (x - self.med) / self.iqr
+            if self.augment and torch.rand(1).item() < 0.30:
+                x = x + torch.randn_like(x) * 0.05
+            yy = torch.tensor(float(self.y[k]), dtype=torch.float32)
+            return x, yy
+
+    for model_name, spec in transformer_specs.items():
+        for fold in range(1, CFG.N_FOLDS + 1):
+            if (model_name, fold) in done:
+                continue
+
+            tr = np.array(splits[str(fold)]["train"], dtype=np.int64)
+            te = np.array(splits[str(fold)]["test"], dtype=np.int64)
+
+            med, iqr = fit_robust_params(X, tr, max_fit_points=200_000)
+
+            train_ds = _MemmapTorchDataset(X, y, tr, med, iqr, augment=True)
+            val_ds = _MemmapTorchDataset(X, y, te, med, iqr, augment=False)
+
+            train_loader = DataLoader(train_ds, batch_size=CFG.BATCH, shuffle=True,
+                                      num_workers=0, pin_memory=(device=="cuda"))
+            val_loader = DataLoader(val_ds, batch_size=CFG.BATCH*2, shuffle=False,
+                                    num_workers=0, pin_memory=(device=="cuda"))
+
+            ModelClass = spec["class"]
+            p = spec["params"]
+            model = ModelClass(n_features=X.shape[1], **p).to(device)
+
+            best_auc = train_torch_model(model, train_loader, val_loader, device,
+                                         epochs=CFG.EPOCHS, patience=CFG.EARLY_PATIENCE)
+
+            # Evaluate
+            model.eval()
+            yp, yt = [], []
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb = xb.to(device, non_blocking=True)
+                    pred = model(xb).detach().cpu().numpy()
+                    yp.append(pred)
+                    yt.append(yb.numpy())
+            yp = np.concatenate(yp)
+            yt = np.concatenate(yt)
+
+            met = compute_metrics(yt, yp)
+
+            # Save fold model + scaler params
+            torch.save({"state_dict": model.state_dict(),
+                        "feature_names": resolved["feature"].tolist(),
+                        "transformer_params": p,
+                        "robust_median": med.tolist(),
+                        "robust_iqr": iqr.tolist()},
+                       os.path.join(P_MODEL_DIR, f"{model_name}_fold{fold}.pt"))
+
+            row = {"model": model_name, "fold": fold, **met, "BestValAUC": best_auc}
+            results_rows.append(row)
+            pd.DataFrame(results_rows).to_csv(P_FOLD_RESULTS, index=False)
+            done.add((model_name, fold))
+
+            print(f"{model_name} fold {fold} saved | ROC_AUC={met['ROC_AUC']:.4f}")
+            del model, train_ds, val_ds, train_loader, val_loader
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
+
+    df = pd.DataFrame(results_rows)
+
+    # ---------------------------
+    # FIXED: Proper model selection by mean CV performance
+    # ---------------------------
+    metric_cols = ["ROC_AUC","PR_AUC","F1","Balanced_Accuracy","MCC","Brier","Log_Loss",
+                   "Sensitivity","Specificity","Precision","NPV"]
+    available = [c for c in metric_cols if c in df.columns]
+
+    mean_df = df.groupby("model")[available].mean().reset_index()
+    std_df  = df.groupby("model")[available].std(ddof=0).reset_index()
+
+    # Build mean±std table
+    ms = mean_df.merge(std_df, on="model", suffixes=("_mean","_std"))
+    ms.to_csv(P_MODEL_MEAN_STD, index=False)
+
+    # Ranking rule:
+    # 1) highest mean ROC_AUC
+    # 2) if tie within 0.001, highest mean PR_AUC
+    # 3) if tie within 0.001, lowest mean Brier
+    mean_df2 = mean_df.copy()
+    mean_df2["neg_Brier"] = -mean_df2["Brier"] if "Brier" in mean_df2.columns else 0.0
+
+    def sort_key(row):
+        return (row.get("ROC_AUC", -np.inf), row.get("PR_AUC", -np.inf), row.get("neg_Brier", -np.inf))
+
+    mean_df2 = mean_df2.sort_values(by=["ROC_AUC","PR_AUC","neg_Brier"], ascending=[False,False,False])
+    mean_df2.drop(columns=["neg_Brier"], inplace=True, errors="ignore")
+    mean_df2.to_csv(P_MODEL_RANKING, index=False)
+
+    best_model_name = mean_df2.iloc[0]["model"]
+    best_model_mean = mean_df2.iloc[0].to_dict()
+
+    # Also store the best single fold run (for diagnostics only)
+    best_single = df.sort_values("ROC_AUC", ascending=False).iloc[0].to_dict()
+    with open(P_BEST_FOLD_EXPORT, "w", encoding="utf-8") as f:
+        json.dump(best_single, f, indent=2)
+
+    # Save best summary (mean-based)
+    with open(P_BEST_SUMMARY, "w", encoding="utf-8") as f:
+        json.dump({"selection_rule":"mean_CV_ROC_AUC_then_PR_AUC_then_low_Brier",
+                   "best_model": best_model_name,
+                   "best_model_mean_metrics": best_model_mean}, f, indent=2)
+
+    print("\nBEST MODEL (MEAN CV, not a single fold):")
+    print(best_model_name, best_model_mean)
+
+    return df, mean_df2, best_model_name
+
+# ---------------------------
+# STEP C: TRAIN FINAL MODEL ON ALL DATA (SAVE FOR MAPPING)
+# ---------------------------
+def train_final_model_all_data(best_model_name, resolved, y, X):
+    # Train winning architecture on ALL sampled data (for map generation)
+    if best_model_name in ["LogisticRegression", "RandomForest", "GradientBoosting"]:
+        if os.path.exists(P_FINAL_MODEL_SK):
+            print("Final sklearn model already exists. Skipping retrain.")
+            return
+        if best_model_name == "LogisticRegression":
+            model = Pipeline([("scaler", StandardScaler()),
+                              ("clf", LogisticRegression(max_iter=1200, class_weight="balanced"))])
+        elif best_model_name == "RandomForest":
+            model = RandomForestClassifier(n_estimators=350, max_depth=16, min_samples_split=10,
+                                           class_weight="balanced", n_jobs=-1, random_state=CFG.RANDOM_STATE)
+        else:
+            model = GradientBoostingClassifier(n_estimators=250, learning_rate=0.05, subsample=0.8,
+                                               max_depth=3, random_state=CFG.RANDOM_STATE)
+
+        model.fit(X, y)
+        joblib.dump(model, P_FINAL_MODEL_SK)
+        print("Saved final sklearn model:", P_FINAL_MODEL_SK)
+        return
+
+    if best_model_name == "FT-Transformer":
+        if os.path.exists(P_FINAL_MODEL_PT) and os.path.exists(P_FINAL_SCALER):
+            print("Final Transformer model already exists. Skipping retrain.")
+            return
+
+        device = CFG.DEVICE
+        all_idx = np.arange(len(y), dtype=np.int64)
+        med, iqr = fit_robust_params(X, all_idx, max_fit_points=300_000)
+
+        with open(P_FINAL_SCALER, "w", encoding="utf-8") as f:
+            json.dump({"robust_median": med.tolist(), "robust_iqr": iqr.tolist(),
+                       "features": resolved["feature"].tolist()}, f, indent=2)
+
+        class AllDS(Dataset):
+            def __init__(self, X_mem, y_arr, med, iqr):
+                self.X = X_mem
+                self.y = y_arr
+                self.med = torch.tensor(med, dtype=torch.float32)
+                self.iqr = torch.tensor(iqr, dtype=torch.float32)
+            def __len__(self): return len(self.y)
+            def __getitem__(self, i):
+                x = torch.from_numpy(np.array(self.X[i], dtype=np.float32, copy=False))
+                x = (x - self.med) / self.iqr
+                yy = torch.tensor(float(self.y[i]), dtype=torch.float32)
+                return x, yy
+
+        ds = AllDS(X, y, med, iqr)
+        dl = DataLoader(ds, batch_size=CFG.BATCH, shuffle=True, num_workers=0, pin_memory=(device=="cuda"))
+
+        model = FTTransformer(n_features=X.shape[1], d_model=128, nhead=8, num_layers=4, dropout=0.2).to(device)
+
+        opt = torch.optim.AdamW(model.parameters(), lr=CFG.LR, weight_decay=CFG.WD)
+        crit = nn.BCELoss()
+
+        for ep in range(10):
+            model.train()
+            for xb, yb in dl:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                pred = model(xb)
+                loss = crit(pred, yb)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+            print(f"Final training epoch {ep+1}/10 done.")
+            gc.collect()
+
+        torch.save({"state_dict": model.state_dict(),
+                    "transformer_params": {"d_model":128,"nhead":8,"num_layers":4,"dropout":0.2},
+                    "feature_names": resolved["feature"].tolist()},
+                   P_FINAL_MODEL_PT)
+        print("Saved final Transformer model:", P_FINAL_MODEL_PT)
+
+        del model, ds, dl
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+        return
+
+    raise RuntimeError(f"Unsupported best model: {best_model_name}")
+
+# ---------------------------
+# STEP D: APPLY FINAL MODEL TO CREATE PREDICTED MAP (STREAMING WINDOWS)
+# ---------------------------
+def apply_model_to_full_map(resolved, transform, crs, H, W):
+    aoi = gpd.read_file(CFG.AOI).to_crs(crs)
+    with rasterio.open(CFG.FLOOD) as ref:
+        ref_profile = ref.profile.copy()
+
+    aoi_mask = geometry_mask(aoi.geometry, (H, W), transform, invert=True)
+
+    use_torch = os.path.exists(P_FINAL_MODEL_PT) and os.path.exists(P_FINAL_SCALER)
+    use_sk = os.path.exists(P_FINAL_MODEL_SK)
+
+    if not (use_torch or use_sk):
+        raise RuntimeError("No final model found. Train final model first.")
+
+    profile = ref_profile.copy()
+    profile.update(dtype=rasterio.float32, count=1, compress="deflate", predictor=2, BIGTIFF="IF_SAFER")
+    prob_dst = rasterio.open(P_PRED_PROB, "w", **profile)
+
+    profile_bin = ref_profile.copy()
+    profile_bin.update(dtype=rasterio.uint8, count=1, compress="deflate", predictor=2, BIGTIFF="IF_SAFER")
+    bin_dst = rasterio.open(P_PRED_BIN, "w", **profile_bin)
+
+    feat_paths = resolved["path"].tolist()
+    C = len(feat_paths)
+
+    if use_sk:
+        sk_model = joblib.load(P_FINAL_MODEL_SK)
+    else:
+        with open(P_FINAL_SCALER, "r", encoding="utf-8") as f:
+            sc = json.load(f)
+        med = np.array(sc["robust_median"], dtype=np.float32)
+        iqr = np.array(sc["robust_iqr"], dtype=np.float32)
+
+        ckpt = torch.load(P_FINAL_MODEL_PT, map_location="cpu")
+        params = ckpt["transformer_params"]
+        model = FTTransformer(n_features=C, **params).to(CFG.DEVICE)
+        model.load_state_dict(ckpt["state_dict"])
+        model.eval()
+
+    datasets = [rasterio.open(p) for p in feat_paths]
+
+    win_size = CFG.WINDOW_SIZE
+    n_win_r = math.ceil(H / win_size)
+    n_win_c = math.ceil(W / win_size)
+
+    for wr in range(n_win_r):
+        for wc in range(n_win_c):
+            row_off = wr * win_size
+            col_off = wc * win_size
+            height = min(win_size, H - row_off)
+            width = min(win_size, W - col_off)
+            window = rasterio.windows.Window(col_off, row_off, width, height)
+
+            m = aoi_mask[row_off:row_off+height, col_off:col_off+width]
+            if not m.any():
+                prob_dst.write(np.zeros((height, width), dtype=np.float32), 1, window=window)
+                bin_dst.write(np.zeros((height, width), dtype=np.uint8), 1, window=window)
+                continue
+
+            stack = np.zeros((height, width, C), dtype=np.float32)
+            for j, ds in enumerate(datasets):
+                arr = ds.read(1, window=window).astype(np.float32)
+                if ds.nodata is not None:
+                    arr = np.where(arr == ds.nodata, np.nan, arr)
+                stack[..., j] = arr
+
+            flat = stack.reshape(-1, C)
+            mflat = m.reshape(-1)
+
+            col_med = np.nanmedian(flat[mflat], axis=0)
+            col_med = np.where(np.isfinite(col_med), col_med, 0.0).astype(np.float32)
+            nanmask = ~np.isfinite(flat)
+            if nanmask.any():
+                flat[nanmask] = np.take(col_med, np.where(nanmask)[1])
+
+            idx = np.where(mflat)[0]
+            Xp = flat[idx]
+
+            if use_sk:
+                prob = sk_model.predict_proba(Xp)[:, 1].astype(np.float32)
+            else:
+                Xp = ((Xp - med) / iqr).astype(np.float32)
+                with torch.no_grad():
+                    probs = []
+                    bs = CFG.PRED_BATCH
+                    for s in range(0, Xp.shape[0], bs):
+                        xb = torch.from_numpy(Xp[s:s+bs]).to(CFG.DEVICE)
+                        p = model(xb).detach().cpu().numpy().astype(np.float32)
+                        probs.append(p)
+                    prob = np.concatenate(probs)
+
+            prob_block = np.zeros((height*width,), dtype=np.float32)
+            prob_block[idx] = prob
+            prob_block = prob_block.reshape(height, width)
+
+            bin_block = (prob_block >= 0.5).astype(np.uint8)
+
+            prob_dst.write(prob_block, 1, window=window)
+            bin_dst.write(bin_block, 1, window=window)
+
+            if (wr * n_win_c + wc) % 20 == 0:
+                print(f"Predicted window {wr*n_win_c+wc+1}/{n_win_r*n_win_c}")
+
+            gc.collect()
+
+    for ds in datasets:
+        ds.close()
+    prob_dst.close()
+    bin_dst.close()
+
+    print("Saved prediction rasters:")
+    print(" -", P_PRED_PROB)
+    print(" -", P_PRED_BIN)
+
+# ---------------------------
+# MAIN
+# ---------------------------
+def main():
+    print("Output directory:", CFG.OUTDIR)
+    print("Device:", CFG.DEVICE)
+
+    resolved, rows, cols, y, groups, transform, crs, H, W, splits, X = prepare_or_resume()
+
+    # Train CV models with resume + fixed model selection
+    fold_df, ranking_df, best_model_name = train_with_resume(resolved, y, splits, X)
+
+    print("\nSaved mean±std table:", P_MODEL_MEAN_STD)
+    print("Saved ranking by mean AUC:", P_MODEL_RANKING)
+
+    # Train final model on all data (for mapping)
+    train_final_model_all_data(best_model_name, resolved, y, X)
+
+    # Apply to full raster stack
+    apply_model_to_full_map(resolved, transform, crs, H, W)
+
+    print("\nDONE. All outputs and checkpoints are saved in:")
+    print(CFG.OUTDIR)
+
+if __name__ == "__main__":
+    main()

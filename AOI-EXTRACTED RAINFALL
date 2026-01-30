@@ -1,0 +1,343 @@
+# =====================================================================================
+# CHIRPS NOV 2025 (DAY=01..31) -> AOI-EXTRACTED RAINFALL MODULE INPUTS (FAST + ROBUST)
+# English-only outputs | Auto-finds Chirps_Nov2025 folder under MyDrive/Transformers
+# COMPLETE, SINGLE-CELL SCRIPT.
+# =====================================================================================
+
+import os, re, json, math
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.features import geometry_mask
+import geopandas as gpd
+import matplotlib.pyplot as plt
+
+# ---------------------------
+# CONFIG
+# ---------------------------
+class CFG:
+    DRIVE_ROOT = "/content/drive"
+    BASE = "/content/drive/MyDrive/Transformers"
+    # Preferred name (but script will auto-find if different):
+    CHIRPS_FOLDER_HINT = "Chirps_Nov2025"
+    AOI_SHP = os.path.join(BASE, "Vale_do_Itajai.shp")
+
+    OUTDIR = os.path.join(BASE, "_2stage_framework")
+    PLOTS = os.path.join(OUTDIR, "plots")
+
+    YEAR = 2025
+    MONTH = 11
+    EVENT_DAY = 23
+
+    QUANTILES = (0.05, 0.25, 0.5, 0.75, 0.95)
+
+os.makedirs(CFG.OUTDIR, exist_ok=True)
+os.makedirs(CFG.PLOTS, exist_ok=True)
+
+# ---------------------------
+# DRIVE MOUNT (SAFE)
+# ---------------------------
+def ensure_drive():
+    if os.path.exists(CFG.DRIVE_ROOT) and os.path.exists(os.path.join(CFG.DRIVE_ROOT, "MyDrive")):
+        print("Google Drive already mounted.")
+        return
+    print("Mounting Google Drive...")
+    from google.colab import drive
+    drive.mount(CFG.DRIVE_ROOT)
+
+ensure_drive()
+
+if not os.path.exists(CFG.BASE):
+    raise RuntimeError(f"BASE not found: {CFG.BASE}. Check your Drive structure.")
+
+# ---------------------------
+# AUTO-FIND CHIRPS FOLDER
+# ---------------------------
+def find_chirps_dir(base_dir, folder_hint):
+    # 1) direct path attempt
+    direct = os.path.join(base_dir, folder_hint)
+    if os.path.isdir(direct):
+        return direct, [direct]
+
+    # 2) search folders under base_dir
+    candidates = []
+    for root, dirs, _ in os.walk(base_dir):
+        for d in dirs:
+            full = os.path.join(root, d)
+            low = d.lower()
+            if "chirps" in low and ("nov" in low or "11" in low) and ("2025" in low):
+                candidates.append(full)
+
+    # 3) broader fallback: any folder containing "chirps"
+    if not candidates:
+        for root, dirs, _ in os.walk(base_dir):
+            for d in dirs:
+                if "chirps" in d.lower():
+                    candidates.append(os.path.join(root, d))
+
+    # rank: prefer ones closer to base_dir and containing nov+2025
+    def score(p):
+        low = os.path.basename(p).lower()
+        s = 0
+        if "nov" in low: s += 5
+        if "2025" in low: s += 5
+        if "11" in low: s += 1
+        depth = p.replace(base_dir, "").count(os.sep)
+        s -= depth * 0.5
+        return s
+
+    candidates = sorted(list(set(candidates)), key=score, reverse=True)
+    best = candidates[0] if candidates else None
+    return best, candidates
+
+CHIRPS_DIR, chirps_candidates = find_chirps_dir(CFG.BASE, CFG.CHIRPS_FOLDER_HINT)
+
+print("BASE:", CFG.BASE)
+print("Preferred CHIRPS folder name hint:", CFG.CHIRPS_FOLDER_HINT)
+if CHIRPS_DIR is None:
+    print("\nFolders scanned but no CHIRPS folder could be identified.")
+    print("Tip: confirm it exists under MyDrive/Transformers.")
+    raise RuntimeError("Could not find any CHIRPS directory under BASE.")
+else:
+    print("\nUsing CHIRPS_DIR:", CHIRPS_DIR)
+    if len(chirps_candidates) > 1:
+        print("Other candidate folders found (top 10):")
+        for p in chirps_candidates[:10]:
+            print(" -", p)
+
+# ---------------------------
+# HELPERS
+# ---------------------------
+def list_chirps_day_rasters(chirps_dir):
+    """
+    Accept GeoTIFFs where filename STEM is numeric: 01.tif, 2.tif, 23.tif -> day=1..31
+    """
+    exts = (".tif", ".tiff", ".TIF", ".TIFF")
+    paths = []
+    for root, _, files in os.walk(chirps_dir):
+        for fn in files:
+            if fn.endswith(exts):
+                paths.append(os.path.join(root, fn))
+    paths = sorted(paths)
+
+    recs = []
+    for p in paths:
+        bn = os.path.basename(p)
+        stem = os.path.splitext(bn)[0].strip()
+        m = re.fullmatch(r"0*([0-9]{1,2})", stem)  # strictly numeric
+        day = int(m.group(1)) if m else None
+        recs.append({"path": p, "basename": bn, "stem": stem, "day": day})
+
+    inv = pd.DataFrame(recs)
+    inv_num = inv.dropna(subset=["day"]).copy()
+    inv_num["day"] = inv_num["day"].astype(int)
+    inv_num = inv_num[(inv_num["day"] >= 1) & (inv_num["day"] <= 31)].copy()
+    inv_num = inv_num.sort_values("day").reset_index(drop=True)
+    return inv, inv_num
+
+def load_aoi(aoi_path):
+    if not os.path.exists(aoi_path):
+        raise RuntimeError(f"AOI shapefile not found: {aoi_path}")
+    aoi = gpd.read_file(aoi_path)
+    if aoi.empty:
+        raise RuntimeError("AOI shapefile is empty.")
+    if aoi.crs is None:
+        raise RuntimeError("AOI shapefile has no CRS defined.")
+    return aoi
+
+def compute_aoi_mask(aoi_gdf, ds):
+    if ds.crs is None:
+        raise RuntimeError("CHIRPS raster CRS is missing.")
+    aoi2 = aoi_gdf.to_crs(ds.crs) if aoi_gdf.crs != ds.crs else aoi_gdf
+    geoms = list(aoi2.geometry)
+    return geometry_mask(geoms, out_shape=(ds.height, ds.width), transform=ds.transform, invert=True)
+
+def read_float_band1(ds):
+    arr = ds.read(1).astype(np.float32, copy=False)
+    if ds.nodata is not None:
+        arr = np.where(arr == ds.nodata, np.nan, arr)
+    return arr
+
+def ewma_api(series, half_life_days):
+    lam = math.log(2.0) / float(half_life_days)
+    api = np.zeros_like(series, dtype=np.float64)
+    for i in range(len(series)):
+        api[i] = series[i] if i == 0 else (series[i] + api[i-1] * math.exp(-lam))
+    return api
+
+def safe_quantiles(vals, qs):
+    if vals.size == 0:
+        return {f"q{int(q*100):02d}": np.nan for q in qs}
+    return {f"q{int(q*100):02d}": float(np.quantile(vals, q)) for q in qs}
+
+# ---------------------------
+# 1) DISCOVER CHIRPS RASTERS
+# ---------------------------
+print("\nDiscovering CHIRPS rasters...")
+inv_all, inv_day = list_chirps_day_rasters(CHIRPS_DIR)
+
+inv_csv = os.path.join(CFG.OUTDIR, "chirps_inventory_nov2025.csv")
+inv_all.to_csv(inv_csv, index=False)
+print("Inventory saved:", inv_csv)
+print("Total rasters found:", len(inv_all))
+print("Numeric-day rasters found:", len(inv_day))
+
+if inv_day.empty:
+    # Help the user: show examples of stems found
+    stems = inv_all["stem"].dropna().astype(str).unique().tolist()[:30]
+    print("\nERROR: No numeric-day rasters detected.")
+    print("Examples of file stems found (first 30):")
+    for s in stems:
+        print(" -", s)
+    raise RuntimeError(
+        "Your CHIRPS files are not named as numeric days (01.tif, 02.tif, ...). "
+        "Rename them or adjust the filename parsing rule."
+    )
+
+print("First 10 daily files:")
+print(inv_day.head(10)[["day", "basename"]].to_string(index=False))
+
+# ---------------------------
+# 2) LOAD AOI
+# ---------------------------
+print("\nLoading AOI geometry...")
+aoi = load_aoi(CFG.AOI_SHP)
+
+# ---------------------------
+# 3) EXTRACT DAILY AOI RAINFALL STATS
+# ---------------------------
+print("\nExtracting AOI rainfall statistics (streaming; one raster at a time)...")
+daily_rows = []
+aoi_mask_cache = None
+cache_key = None
+
+for i, r in inv_day.iterrows():
+    day = int(r["day"])
+    path = r["path"]
+
+    with rasterio.open(path) as ds:
+        key = (ds.width, ds.height, ds.transform, str(ds.crs))
+        if (aoi_mask_cache is None) or (cache_key != key):
+            aoi_mask_cache = compute_aoi_mask(aoi, ds)
+            cache_key = key
+
+        arr = read_float_band1(ds)
+        vals = arr[aoi_mask_cache]
+        vals = vals[np.isfinite(vals)]
+
+        stats = {
+            "mean": float(np.mean(vals)) if vals.size else np.nan,
+            "sum": float(np.sum(vals)) if vals.size else np.nan,
+            "n": int(vals.size),
+        }
+        qs = safe_quantiles(vals, CFG.QUANTILES)
+
+    date = pd.Timestamp(year=CFG.YEAR, month=CFG.MONTH, day=day)
+    daily_rows.append({"date": date, "day": day, **stats, **qs})
+
+    if (i + 1) % 5 == 0 or (i + 1) == len(inv_day):
+        print(f"  processed {i+1}/{len(inv_day)} days")
+
+ts = pd.DataFrame(daily_rows).sort_values("day").reset_index(drop=True)
+
+ts_csv = os.path.join(CFG.OUTDIR, "chirps_aoi_daily_timeseries_nov2025.csv")
+ts.to_csv(ts_csv, index=False)
+print("\nSaved daily AOI time series:", ts_csv)
+
+# ---------------------------
+# 4) BUILD EVENT FEATURES (2025-11-23)
+# ---------------------------
+event_date = pd.Timestamp(year=CFG.YEAR, month=CFG.MONTH, day=CFG.EVENT_DAY)
+if event_date not in set(ts["date"]):
+    available = sorted([d.date() for d in ts["date"].tolist()])
+    raise RuntimeError(f"Event date {event_date.date()} not present. Available dates: {available[:5]} ... {available[-5:]}")
+
+df = ts.set_index("date").sort_index()
+df["P_mean"] = df["mean"].astype(float)
+
+def lag(date, k):
+    d = date - pd.Timedelta(days=k)
+    return float(df.loc[d, "P_mean"]) if d in df.index else np.nan
+
+def accum(date, w):
+    start = date - pd.Timedelta(days=w-1)
+    if start in df.index and date in df.index:
+        wv = df.loc[start:date, "P_mean"]
+    else:
+        wv = df.loc[:date, "P_mean"].tail(w)
+    return float(np.nansum(wv.values)) if wv.shape[0] else np.nan
+
+p = df["P_mean"].fillna(0.0).values
+df["API7"]  = ewma_api(p, 7)
+df["API14"] = ewma_api(p, 14)
+
+mu = float(np.nanmean(df["P_mean"].values))
+sd = float(np.nanstd(df["P_mean"].values) + 1e-12)
+df["P_z"] = (df["P_mean"] - mu) / sd
+
+event_features = {
+    "event_date": str(event_date.date()),
+    "rainfall_definition": "CHIRPS daily rainfall aggregated over AOI; metric = mean over AOI pixels",
+    "P0_event_day": lag(event_date, 0),
+    "P1_lag1": lag(event_date, 1),
+    "P2_lag2": lag(event_date, 2),
+    "P3_lag3": lag(event_date, 3),
+    "P_accum_3d": accum(event_date, 3),
+    "P_accum_7d": accum(event_date, 7),
+    "P_accum_14d": accum(event_date, 14),
+    "API7_event": float(df.loc[event_date, "API7"]),
+    "API14_event": float(df.loc[event_date, "API14"]),
+    "P_z_event": float(df.loc[event_date, "P_z"]),
+    "month_mean": mu,
+    "month_std": sd,
+}
+
+event_json = os.path.join(CFG.OUTDIR, f"event_{event_date.date()}_rain_features.json")
+with open(event_json, "w", encoding="utf-8") as f:
+    json.dump(event_features, f, indent=2)
+
+event_csv = os.path.join(CFG.OUTDIR, f"event_{event_date.date()}_rain_features.csv")
+pd.DataFrame([event_features]).to_csv(event_csv, index=False)
+
+print("\nSaved event rainfall features:")
+print(" -", event_json)
+print(" -", event_csv)
+
+# ---------------------------
+# 5) PLOTS
+# ---------------------------
+plt.figure(figsize=(12, 4))
+plt.plot(df.index, df["P_mean"].values, marker="o", linewidth=2)
+plt.title("CHIRPS AOI mean rainfall - November 2025")
+plt.xlabel("Date")
+plt.ylabel("Rainfall (mm/day) - AOI mean")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+ts_png = os.path.join(CFG.PLOTS, "chirps_timeseries_nov2025.png")
+plt.savefig(ts_png, dpi=300)
+plt.close()
+
+w14_start = event_date - pd.Timedelta(days=13)
+w14 = df.loc[w14_start:event_date, "P_mean"].copy()
+plt.figure(figsize=(12, 4))
+plt.bar(w14.index.astype(str), w14.values)
+plt.title(f"Event window rainfall (14 days ending {event_date.date()}) - AOI mean")
+plt.xlabel("Date")
+plt.ylabel("Rainfall (mm/day) - AOI mean")
+plt.xticks(rotation=60, ha="right")
+plt.grid(alpha=0.3, axis="y")
+plt.tight_layout()
+ev_png = os.path.join(CFG.PLOTS, f"event_window_bars_{event_date.date()}.png")
+plt.savefig(ev_png, dpi=300)
+plt.close()
+
+print("\nSaved plots:")
+print(" -", ts_png)
+print(" -", ev_png)
+
+print("\nDONE.")
+print("Key outputs:")
+print(" - Daily AOI series:", ts_csv)
+print(" - Event features JSON:", event_json)
+print(" - Event features CSV:", event_csv)
+print(" - Plots folder:", CFG.PLOTS)
